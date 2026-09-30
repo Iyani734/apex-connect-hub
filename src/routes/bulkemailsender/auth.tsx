@@ -1,0 +1,124 @@
+import * as React from "react";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { Mail } from "lucide-react";
+import { toast } from "sonner";
+import { supabase } from "@/integrations/supabase/client";
+import { lovable } from "@/integrations/lovable/index";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+
+export const Route = createFileRoute("/bulkemailsender/auth")({
+  head: () => ({
+    meta: [
+      { title: "Sign in — OutreachOS" },
+      { name: "description", content: "Sign in to your outreach workspace to manage prospects, campaigns and connected inboxes." },
+      { property: "og:title", content: "Sign in — OutreachOS" },
+      { property: "og:description", content: "Access your outreach CRM and email campaign dashboard." },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary" },
+    ],
+  }),
+  component: AuthPage,
+});
+
+function AuthPage() {
+  const navigate = useNavigate();
+  const [mode, setMode] = React.useState<"signin" | "signup">("signin");
+  const [email, setEmail] = React.useState("");
+  const [password, setPassword] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    void supabase.auth.getSession().then(({ data }) => {
+      if (data.session) void navigate({ to: "/bulkemailsender" });
+    });
+  }, [navigate]);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      if (mode === "signup") {
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { emailRedirectTo: window.location.origin },
+        });
+        if (error) throw error;
+        if (!data.session) {
+          toast.success("Account created", {
+            description: "Check your inbox and confirm your email to sign in.",
+          });
+          return;
+        }
+        toast.success("Account created", { description: "You're signed in." });
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      }
+      await navigate({ to: "/bulkemailsender" });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Authentication failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const google = async () => {
+    // Outside Lovable hosting (e.g. localhost), use the database's own Google sign-in.
+    const onLovable = /lovable\.app$|lovableproject\.com$|lovable\.dev$/.test(window.location.hostname);
+    if (!onLovable) {
+      const { error } = await supabase.auth.signInWithOAuth({ provider: "google", options: { redirectTo: window.location.origin } });
+      if (error) toast.error("Google sign-in isn't set up for this environment — use email and password.");
+      return;
+    }
+    const result = await lovable.auth.signInWithOAuth("google", { redirect_uri: window.location.origin });
+    if (result.error) {
+      toast.error("Google sign-in failed");
+      return;
+    }
+    if (result.redirected) return;
+    await navigate({ to: "/bulkemailsender" });
+  };
+
+  const unlock = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email: WORKSPACE_EMAIL, password });
+      if (error) throw new Error("Incorrect password");
+      await navigate({ to: "/bulkemailsender" });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Incorrect password");
+    } finally {
+      setBusy(false);
+    }
+  };
+  void submit; void google; void mode; void setMode; void email; void setEmail;
+
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-background px-4">
+      <div className="w-full max-w-sm">
+        <div className="mb-6 text-center">
+          <div className="mx-auto mb-3 grid size-11 place-items-center rounded-xl bg-primary text-primary-foreground">
+            <Mail className="size-5" />
+          </div>
+          <h1 className="text-xl font-semibold tracking-tight text-foreground">OutreachOS</h1>
+          <p className="mt-1 text-sm text-muted-foreground">Enter the workspace password</p>
+        </div>
+        <form onSubmit={unlock} className="surface-card space-y-3 p-5">
+          <div className="space-y-1.5">
+            <Label htmlFor="password">Password</Label>
+            <Input id="password" type="password" required autoFocus value={password} onChange={(e) => setPassword(e.target.value)} />
+          </div>
+          <Button type="submit" className="w-full" disabled={busy}>
+            Enter
+          </Button>
+        </form>
+      </div>
+    </main>
+  );
+}
+
+const WORKSPACE_EMAIL = "webd2086@gmail.com";

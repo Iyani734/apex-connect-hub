@@ -1,0 +1,424 @@
+import * as React from "react";
+import { createFileRoute, Link, useParams } from "@tanstack/react-router";
+import { ArrowLeft, Ban, Eye, MailCheck, Pause, Pencil, Play, RefreshCw, Send, UserPlus } from "lucide-react";
+import { toast } from "sonner";
+import { campaignStats, useLookups, useOutreach } from "@/lib/outreach/store";
+import { formatDate, formatShort, pct } from "@/lib/outreach/format";
+import { buildVars, fillTemplate } from "@/lib/outreach/merge";
+import { CategoryChip, EmptyState, Pill, ProgressBar, SectionCard, StatusBadge } from "@/components/app/primitives";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { useServerFn } from "@tanstack/react-start";
+import { sendCampaignBatch, sendTestEmail, syncCampaignReplies } from "@/lib/campaign-send.functions";
+
+export const Route = createFileRoute("/bulkemailsender/_authenticated/campaigns/$campaignId")({
+  head: () => ({
+    meta: [
+      { title: "Campaign detail — OutreachOS" },
+      { name: "description", content: "Sending progress, per-recipient delivery state, replies and follow-ups for this campaign." },
+      { property: "og:title", content: "Campaign detail — OutreachOS" },
+      { property: "og:description", content: "Track every recipient of this outreach campaign in real time." },
+    ],
+  }),
+  component: CampaignDetail,
+});
+
+function CampaignDetail() {
+  const { campaignId } = useParams({ from: "/bulkemailsender/_authenticated/campaigns/$campaignId" });
+  const store = useOutreach();
+  const lookups = useLookups();
+  const sendBatchFn = useServerFn(sendCampaignBatch);
+  const testSendFn = useServerFn(sendTestEmail);
+  const syncRepliesFn = useServerFn(syncCampaignReplies);
+  const [sending, setSending] = React.useState(false);
+  const [testing, setTesting] = React.useState(false);
+  const [syncing, setSyncing] = React.useState(false);
+  const [previewOpen, setPreviewOpen] = React.useState(false);
+  const [previewId, setPreviewId] = React.useState<string>("");
+  const [picking, setPicking] = React.useState(false);
+  const [picked, setPicked] = React.useState<string[]>([]);
+  const campaign = store.campaigns.find((c) => c.id === campaignId);
+
+  const sendTest = async () => {
+    if (!campaign) return;
+    setTesting(true);
+    try {
+      const res = await testSendFn({
+        data: { campaignId: campaign.id, ...(previewId ? { prospectId: previewId } : {}) },
+      });
+      if (res.needsConnection) {
+        toast.error("Connect an email account first", { description: "Add Gmail or SMTP on the Email Accounts page." });
+      } else if (res.reconnectRequired) {
+        toast.error("Gmail access expired", { description: "Reconnect Gmail on the Email Accounts page." });
+      } else if (res.ok) {
+        toast.success(`Test sent to ${res.to}`, { description: "Check your inbox for the [TEST] email." });
+      } else {
+        toast.error("Test send failed", { description: res.error ?? "Please try again." });
+      }
+    } catch (err) {
+      toast.error("Test send failed", { description: err instanceof Error ? err.message : "Please try again." });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const syncReplies = async () => {
+    if (!campaign) return;
+    setSyncing(true);
+    try {
+      const res = await syncRepliesFn({ data: { campaignId: campaign.id } });
+      if (res.reconnectRequired) toast.error("Gmail access expired", { description: "Reconnect Gmail to check replies." });
+      else if (res.unsupported) toast.message("Reply checking needs Gmail", { description: "Connect Gmail to detect replies automatically." });
+      else toast.success(`${res.replies} new repl${res.replies === 1 ? "y" : "ies"} found`, { description: `${res.checked} sent emails checked.` });
+      await store.refresh();
+    } catch (err) {
+      toast.error("Could not check replies", { description: err instanceof Error ? err.message : "Please try again." });
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const send = async () => {
+    if (!campaign) return;
+    setSending(true);
+    try {
+      const res = await sendBatchFn({ data: { campaignId: campaign.id } });
+      if (res.needsConnection) {
+        toast.error("Connect a Gmail account first", { description: "Go to Email Accounts and connect Gmail." });
+      } else if (res.reconnectRequired) {
+        toast.error("Gmail access expired", { description: "Reconnect Gmail on the Email Accounts page." });
+      } else if (res.sent === 0 && res.failed === 0) {
+        toast.message("Nothing to send", { description: "No one is queued in this campaign yet." });
+      } else {
+        if (res.sent > 0) toast.success(`${res.sent} email${res.sent === 1 ? "" : "s"} sent`);
+        if (res.failed > 0) toast.error(`${res.failed} failed`, { description: res.errors[0] ?? "" });
+      }
+      await store.refresh();
+    } catch (err) {
+      toast.error("Sending failed", { description: err instanceof Error ? err.message : "Please try again." });
+    } finally {
+      setSending(false);
+    }
+  };
+
+  if (!campaign) {
+    return (
+      <EmptyState
+        title="Campaign not found"
+        action={
+          <Button asChild>
+            <Link to="/bulkemailsender/campaigns">Back to campaigns</Link>
+          </Button>
+        }
+      />
+    );
+  }
+
+  const stats = campaignStats(campaign.id, store.recipients, store.prospects);
+  const rows = store.recipients.filter((r) => r.campaignId === campaign.id);
+  const account = lookups.account(campaign.emailAccountId);
+  const inCampaign = new Set(rows.map((r) => r.prospectId));
+  const eligible = store.prospects.filter(
+    (p) =>
+      !inCampaign.has(p.id) &&
+      (!campaign.categoryId || p.categoryId === campaign.categoryId) &&
+      p.status !== "do_not_contact",
+  );
+
+  const previewCandidates = rows
+    .map((r) => lookups.prospect(r.prospectId))
+    .filter((p): p is NonNullable<typeof p> => !!p);
+  const previewProspect =
+    previewCandidates.find((p) => p.id === previewId) ?? previewCandidates[0] ?? store.prospects[0] ?? null;
+  const previewVars = buildVars(
+    previewProspect
+      ? {
+          company: previewProspect.company,
+          contactName: previewProspect.contactName,
+          email: previewProspect.email,
+          website: previewProspect.website ?? null,
+          industry: previewProspect.industry ?? null,
+          city: previewProspect.city,
+          country: previewProspect.country,
+        }
+      : { company: "Sample Company", contactName: "Alex Doe", city: "Nairobi", country: "Kenya" },
+    store.user.name,
+  );
+  const previewSubject = fillTemplate(campaign.subject, previewVars);
+  const previewBody = fillTemplate(campaign.body, previewVars);
+
+
+  return (
+    <div className="space-y-6">
+      <Link to="/bulkemailsender/campaigns" className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground">
+        <ArrowLeft className="size-4" /> Campaigns
+      </Link>
+
+      <div className="surface-card p-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-2xl font-semibold text-foreground">{campaign.name}</h1>
+              <Pill tone={campaign.status === "completed" ? "success" : campaign.status === "paused" ? "warn" : "accent"}>
+                {campaign.status}
+              </Pill>
+            </div>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {campaign.purpose}
+              {account ? ` · ${account.label} (${account.address})` : " · no sending account linked"} · created{" "}
+              {formatDate(campaign.createdAt)}
+            </p>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <CategoryChip category={lookups.category(campaign.categoryId)} />
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                Send from
+                <select
+                  value={campaign.emailAccountId ?? ""}
+                  onChange={(e) => {
+                    store.updateCampaign(campaign.id, { emailAccountId: e.target.value });
+                    const next = store.accounts.find((a) => a.id === e.target.value);
+                    toast.success(next ? `Sending from ${next.address}` : "Sending address cleared");
+                  }}
+                  className="h-9 rounded-lg border border-border bg-card px-2.5 text-sm text-foreground"
+                >
+                  <option value="">Choose an address…</option>
+                  {store.accounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.label} ({a.address})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {campaign.status === "draft" || campaign.status === "scheduled" ? (
+              <Button asChild>
+                <Link to="/bulkemailsender/campaigns/new" search={{ edit: campaign.id }}>
+                  <Pencil className="size-4" /> Edit draft
+                </Link>
+              </Button>
+            ) : null}
+            <Button variant="outline" onClick={() => { setPicked([]); setPicking((v) => !v); }}>
+              <UserPlus className="size-4" /> Add recipients
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setPreviewId((prev) => prev || previewCandidates[0]?.id || store.prospects[0]?.id || "");
+                setPreviewOpen(true);
+              }}
+            >
+              <Eye className="size-4" /> Preview as recipient
+            </Button>
+            <Button variant="outline" disabled={testing} onClick={() => void sendTest()}>
+              <MailCheck className="size-4" /> {testing ? "Sending…" : "Send test to me"}
+            </Button>
+            <Button variant="outline" disabled={syncing} onClick={() => void syncReplies()}>
+              <RefreshCw className={syncing ? "size-4 animate-spin" : "size-4"} /> Check replies
+            </Button>
+            {campaign.status === "sending" ? (
+              <Button variant="outline" onClick={() => { store.updateCampaign(campaign.id, { status: "paused" }); toast.message("Campaign paused"); }}>
+                <Pause className="size-4" /> Pause
+              </Button>
+            ) : campaign.status !== "completed" ? (
+              <Button onClick={() => { store.updateCampaign(campaign.id, { status: "sending" }); toast.success("Campaign resumed"); }}>
+                <Play className="size-4" /> Resume
+              </Button>
+            ) : null}
+            <Button variant="outline" disabled={sending || stats.sent >= stats.recipients} onClick={() => void send()}>
+              <Send className="size-4" /> {sending ? "Sending…" : "Send next batch"}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => { store.updateCampaign(campaign.id, { status: "cancelled" }); toast.message("Remaining emails cancelled"); }}
+            >
+              <Ban className="size-4" /> Cancel remaining
+            </Button>
+          </div>
+        </div>
+
+        {picking ? (
+          <div className="mt-5 rounded-lg border border-border p-4">
+            <p className="text-sm font-medium text-foreground">
+              Prospects in this category, not yet in the campaign
+            </p>
+            {eligible.length === 0 ? (
+              <p className="mt-2 text-sm text-muted-foreground">
+                No matching prospects. Add prospects in this campaign's category first.
+              </p>
+            ) : (
+              <>
+                <div className="mt-3 max-h-64 space-y-1 overflow-y-auto">
+                  {eligible.map((p) => (
+                    <label key={p.id} className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-1.5 text-sm hover:bg-muted/60">
+                      <input
+                        type="checkbox"
+                        checked={picked.includes(p.id)}
+                        onChange={(e) =>
+                          setPicked((prev) => (e.target.checked ? [...prev, p.id] : prev.filter((x) => x !== p.id)))
+                        }
+                      />
+                      <span className="font-medium text-foreground">{p.company}</span>
+                      <span className="text-muted-foreground">{p.contactName} · {p.email}</span>
+                    </label>
+                  ))}
+                </div>
+                <div className="mt-3 flex gap-2">
+                  <Button
+                    disabled={picked.length === 0}
+                    onClick={() => {
+                      const n = store.addRecipients(campaign.id, picked);
+                      toast.success(`${n} recipient${n === 1 ? "" : "s"} added`);
+                      setPicked([]);
+                      setPicking(false);
+                    }}
+                  >
+                    Add {picked.length || ""} to campaign
+                  </Button>
+                  <Button variant="ghost" onClick={() => setPicking(false)}>Cancel</Button>
+                </div>
+              </>
+            )}
+          </div>
+        ) : null}
+
+        <div className="mt-6">
+          <div className="mb-1.5 flex justify-between text-sm">
+            <span className="text-muted-foreground">
+              {stats.sent} / {stats.recipients} sent · batches of {campaign.batchSize} every {campaign.intervalMinutes} min
+            </span>
+            <span className="num font-medium text-foreground">{stats.progress}%</span>
+          </div>
+          <ProgressBar value={stats.progress} />
+        </div>
+
+        <div className="mt-6 grid grid-cols-2 gap-4 border-t border-border pt-5 sm:grid-cols-4 xl:grid-cols-7">
+          <Stat label="Recipients" value={stats.recipients} />
+          <Stat label="Sent" value={stats.sent} />
+          <Stat label="Delivered" value={stats.delivered} />
+          <Stat label="Opened" value={stats.opened} />
+          <Stat label="Replies" value={stats.replied} />
+          <Stat label="Interested" value={stats.interested} />
+          <Stat label="Won" value={stats.won} />
+        </div>
+      </div>
+
+      <SectionCard title="Email" description={campaign.subject}>
+        <div className="whitespace-pre-wrap rounded-lg border border-border bg-muted/40 p-4 text-sm text-foreground">
+          {campaign.body}
+        </div>
+      </SectionCard>
+
+      <SectionCard title="Recipients" description={`Reply rate ${pct(stats.replied, stats.sent)}%`} bodyClassName="p-0">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border text-left text-xs text-muted-foreground">
+                <th className="px-5 py-3 font-medium">Recipient</th>
+                <th className="px-3 py-3 font-medium">Company</th>
+                <th className="px-3 py-3 font-medium">Status</th>
+                <th className="px-3 py-3 font-medium">Sent</th>
+                <th className="px-3 py-3 font-medium">Opened</th>
+                <th className="px-3 py-3 font-medium">Replied</th>
+                <th className="px-5 py-3 font-medium">Follow-up</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const p = lookups.prospect(r.prospectId);
+                if (!p) return null;
+                return (
+                  <tr key={r.id} className="border-b border-border/70 last:border-0 hover:bg-muted/50">
+                    <td className="px-5 py-3">
+                      <Link
+                        to="/bulkemailsender/prospects/$prospectId"
+                        params={{ prospectId: p.id }}
+                        className="font-medium text-foreground hover:text-primary"
+                      >
+                        {p.contactName}
+                      </Link>
+                      <p className="text-xs text-muted-foreground">{p.email}</p>
+                    </td>
+                    <td className="px-3 py-3 text-muted-foreground">{p.company}</td>
+                    <td className="px-3 py-3">
+                      <StatusBadge status={p.status} />
+                    </td>
+                    <td className="px-3 py-3 text-muted-foreground">{formatShort(r.sentAt)}</td>
+                    <td className="px-3 py-3 text-muted-foreground">{r.openedAt ? `${r.openCount}×` : "—"}</td>
+                    <td className="px-3 py-3 text-muted-foreground">{formatShort(r.repliedAt)}</td>
+                    <td className="px-5 py-3 text-muted-foreground">{formatShort(r.followUpAt)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </SectionCard>
+
+      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Preview as recipient</DialogTitle>
+            <DialogDescription>Exactly what this person receives, with every detail filled in.</DialogDescription>
+          </DialogHeader>
+
+          <label className="flex items-center gap-2 text-sm text-muted-foreground">
+            Preview for
+            <select
+              value={previewProspect?.id ?? ""}
+              onChange={(e) => setPreviewId(e.target.value)}
+              className="h-9 flex-1 rounded-lg border border-border bg-card px-2.5 text-sm text-foreground"
+            >
+              {(previewCandidates.length ? previewCandidates : store.prospects).map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.contactName || p.company} — {p.email}
+                </option>
+              ))}
+              {previewCandidates.length === 0 && store.prospects.length === 0 ? (
+                <option value="">Sample recipient</option>
+              ) : null}
+            </select>
+          </label>
+
+          <div className="rounded-lg border border-border">
+            <div className="border-b border-border px-4 py-3 text-sm">
+              <p className="text-muted-foreground">
+                From: <span className="text-foreground">{account ? `${account.label} <${account.address}>` : "no sending account linked"}</span>
+              </p>
+              <p className="text-muted-foreground">
+                To: <span className="text-foreground">{previewProspect?.email ?? "sample@example.com"}</span>
+              </p>
+              <p className="mt-1 font-medium text-foreground">{previewSubject}</p>
+            </div>
+            <div className="max-h-80 overflow-y-auto whitespace-pre-wrap px-4 py-4 text-sm text-foreground">
+              {previewBody}
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setPreviewOpen(false)}>Close</Button>
+            <Button disabled={testing} onClick={() => void sendTest()}>
+              <MailCheck className="size-4" /> {testing ? "Sending…" : "Send this to me"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: number }) {
+  return (
+    <div>
+      <p className="num text-2xl font-semibold text-foreground">{value}</p>
+      <p className="text-xs text-muted-foreground">{label}</p>
+    </div>
+  );
+}
